@@ -15,6 +15,12 @@ Ablauf pro Regelzyklus (20 Hz):
          /robot/aeb_emergency_stop   (Bool)    True bei Vollbremsung
          /robot/aeb/status           (String)  Klartext fuer das Dashboard
 
+Zusaetzlich zum TTC-Regler gibt es einen rastenden Abstandshalt. Der TTC-Regler
+ist im Stillstand zwangslaeufig inaktiv (bei v = 0 ist eine TTC nicht
+definiert), weshalb er allein den Roboter an ein Hindernis herankriechen
+liesse. Der Halt ist geschwindigkeitsunabhaengig, rastet ein und loest nur,
+wenn der Weg sichtbar frei ist oder /robot/aeb/reset empfangen wird.
+
 Der Multiplexer wertet diese Topics aus: der Bremswert drosselt linear.x
 proportional, der Notstopp setzt die Geschwindigkeit hart auf 0.
 
@@ -34,7 +40,7 @@ from rclpy.qos import qos_profile_sensor_data
 
 from sensor_msgs.msg import LaserScan
 from nav_msgs.msg import Odometry
-from std_msgs.msg import Bool, Float32, String
+from std_msgs.msg import Bool, Empty, Float32, String
 
 try:
     # Normalfall: als Teil des ROS2-Packages
@@ -77,6 +83,38 @@ class AEBNode(Node):
 
         self.declare_parameter('loop_period', 0.05)  # Regeltakt [s] -> 20 Hz
 
+        # ── Haltezustand (Standstill Hold) ───────────────────────────────────
+        # Der TTC-Regler allein laesst den Roboter an ein Hindernis heran-
+        # kriechen, und zwar zwangslaeufig:
+        #
+        #   1. Vollbremsung -> Roboter steht.
+        #   2. Im Stillstand ist speed < min_speed, der Regler ist damit
+        #      inaktiv und gibt brake = 0.0 zurueck (aeb_logic.py:56). Das ist
+        #      korrekt, denn eine TTC ist bei v = 0 nicht definiert.
+        #   3. Der Multiplexer gibt den anliegenden Fahrbefehl wieder durch,
+        #      der Roboter faehrt an.
+        #   4. Unterhalb von min_dist (Eigenkontur-Filter) verschwindet das
+        #      Hindernis aus dem Scan, der Abstand wird inf, es wird gar nicht
+        #      mehr gebremst -- und der Roboter faehrt hinein.
+        #
+        # Deshalb rastet hier ein zweiter, rein abstandsbasierter Halt ein. Er
+        # ist von der Geschwindigkeit unabhaengig und loest nicht von selbst.
+        self.declare_parameter('hold_enabled', True)
+        self.declare_parameter('hold_distance', 0.35)     # darunter rastet der Halt ein [m]
+
+        # Freigabe: der Weg muss ueber dieser Entfernung *sichtbar* frei sein.
+        # Bewusst grosszuegig, denn der Wert muss ueber dem Abstand liegen, bei
+        # dem der Roboter zum Stehen kommt, sonst loest der Halt sofort wieder.
+        self.declare_parameter('release_distance', 1.00)  # [m]
+        self.declare_parameter('release_ticks', 10)       # 0.5 s Bestaetigung
+
+        # inf bedeutet zweierlei: "Weg frei" ODER "Hindernis im Totbereich des
+        # LiDAR". Beides ist nicht unterscheidbar. Darum zaehlt inf
+        # standardmaessig NICHT als Freigabe -- sonst wuerde genau der Fall,
+        # gegen den der Halt schuetzt, ihn aufheben. Freigabe dann per
+        # /robot/aeb/reset oder durch Rueckwaertsfahren.
+        self.declare_parameter('release_on_inf', False)
+
         p = self.get_parameter
         self.corridor_half_width = p('corridor_half_width').value
         self.min_dist            = p('min_dist').value
@@ -84,6 +122,12 @@ class AEBNode(Node):
         self.front_offset_rad    = math.radians(p('front_offset_deg').value)
         self.brake_ramp_rate     = p('brake_ramp_rate').value
         self.period              = p('loop_period').value
+
+        self.hold_enabled     = bool(p('hold_enabled').value)
+        self.hold_distance    = float(p('hold_distance').value)
+        self.release_distance = float(p('release_distance').value)
+        self.release_ticks    = max(1, int(p('release_ticks').value))
+        self.release_on_inf   = bool(p('release_on_inf').value)
 
         # ── Regler ───────────────────────────────────────────────────────────
         self.aeb = AEBController(
@@ -101,12 +145,22 @@ class AEBNode(Node):
         self.dist_hist = deque(maxlen=smoothing_n)
         self.last_distance = float('inf')
 
+        # Haltezustand. `hold_latched` bleibt True, bis der Weg nachweislich
+        # frei ist oder per /robot/aeb/reset freigegeben wird.
+        self.hold_latched = False
+        self.clear_ticks = 0
+        self.hold_reason = ''
+
         # ── Subscriber ───────────────────────────────────────────────────────
         self.scan_sub = self.create_subscription(
             LaserScan, '/scan', self.scan_callback, qos_profile_sensor_data)
 
         self.odom_sub = self.create_subscription(
             Odometry, '/odom', self.odom_callback, 10)
+
+        # Manuelle Freigabe des Haltezustands.
+        self.reset_sub = self.create_subscription(
+            Empty, '/robot/aeb/reset', self.reset_callback, 10)
 
         # ── Publisher ────────────────────────────────────────────────────────
         self.brake_pub  = self.create_publisher(Float32, '/robot/aeb/brake', 10)
@@ -120,6 +174,15 @@ class AEBNode(Node):
             f'TTC warn/brake: {p("ttc_warn").value:.2f}/{p("ttc_brake").value:.2f} s, '
             f'Korridor +/-{self.corridor_half_width:.2f} m, '
             f'Reichweite {self.min_dist:.2f}-{self.max_dist:.2f} m')
+        if self.hold_enabled:
+            self.get_logger().info(
+                f'Haltezustand aktiv: rastet unter {self.hold_distance:.2f} m '
+                f'ein, Freigabe ab {self.release_distance:.2f} m '
+                f'({self.release_ticks} Zyklen) oder /robot/aeb/reset')
+        else:
+            self.get_logger().warn(
+                'Haltezustand DEAKTIVIERT — der Roboter kann nach einer '
+                'Vollbremsung wieder anfahren und das Hindernis beruehren.')
 
     # ── Callbacks ────────────────────────────────────────────────────────────
     def scan_callback(self, msg):
@@ -129,6 +192,64 @@ class AEBNode(Node):
         # Vorwaertsgeschwindigkeit aus der Odometrie. Betrag, damit ein
         # negatives Vorzeichen der Hardware das AEB nicht deaktiviert.
         self.speed = abs(msg.twist.twist.linear.x)
+
+    def reset_callback(self, _msg):
+        if self.hold_latched:
+            self.get_logger().warn(
+                'HALT MANUELL FREIGEGEBEN — der Weg wird nicht geprueft.')
+        self.hold_latched = False
+        self.clear_ticks = 0
+        self.hold_reason = ''
+
+    # ── Haltezustand ─────────────────────────────────────────────────────────
+    def update_hold(self, brake_target, distance):
+        """
+        Rastenden Abstandshalt fuehren und zurueckgeben, ob er aktiv ist.
+
+        Einrasten, sobald eines von beiden zutrifft:
+          * der TTC-Regler fordert eine Vollbremsung, oder
+          * das Hindernis ist naeher als hold_distance.
+
+        Das erste Kriterium verhindert, dass der Roboter nach einer
+        Vollbremsung ueberhaupt erst wieder anfaehrt. Das zweite greift auch
+        im Stillstand, wo der TTC-Regler grundsaetzlich nichts liefert.
+
+        Freigabe nur, wenn der Weg release_ticks Zyklen lang *sichtbar* weiter
+        als release_distance frei ist. Ein inf zaehlt dabei nicht mit (siehe
+        release_on_inf), weil es ein Hindernis im Totbereich des LiDAR genauso
+        aussehen laesst wie eine freie Fahrbahn.
+        """
+        if not self.hold_enabled:
+            return False
+
+        if not self.hold_latched:
+            if brake_target >= 1.0:
+                self.hold_latched = True
+                self.hold_reason = 'Vollbremsung'
+            elif math.isfinite(distance) and distance <= self.hold_distance:
+                self.hold_latched = True
+                self.hold_reason = f'Hindernis {distance:.2f} m'
+            if self.hold_latched:
+                self.clear_ticks = 0
+                self.get_logger().warn(
+                    f'HALT EINGERASTET ({self.hold_reason}). Vorwaertsfahrt '
+                    f'gesperrt, bis der Weg > {self.release_distance:.2f} m '
+                    'frei ist oder /robot/aeb/reset kommt.')
+            return self.hold_latched
+
+        # Eingerastet: Freigabebedingung pruefen.
+        clear = (math.isfinite(distance) and distance >= self.release_distance)
+        if not clear and math.isinf(distance) and self.release_on_inf:
+            clear = True
+
+        self.clear_ticks = self.clear_ticks + 1 if clear else 0
+        if self.clear_ticks >= self.release_ticks:
+            self.hold_latched = False
+            self.clear_ticks = 0
+            self.hold_reason = ''
+            self.get_logger().info('HALT AUFGEHOBEN — Weg ist frei.')
+
+        return self.hold_latched
 
     # ── Umfelderfassung ──────────────────────────────────────────────────────
     def forward_distance(self, scan):
@@ -195,23 +316,33 @@ class AEBNode(Node):
         else:
             self.brake_cmd = brake_target
 
-        self.publish(self.brake_cmd, distance)
+        # Haltezustand hat Vorrang vor dem Regler und ueberschreibt die Rampe:
+        # ein eingerasteter Halt ist keine Dosierung, sondern eine Sperre.
+        holding = self.update_hold(brake_target, distance)
+        if holding:
+            self.brake_cmd = 1.0
 
-    def publish(self, brake, distance):
+        self.publish(self.brake_cmd, distance, holding)
+
+    def publish(self, brake, distance, holding=False):
         brake_msg = Float32()
         brake_msg.data = float(brake)
         self.brake_pub.publish(brake_msg)
 
-        # Vollbremsung wird zusaetzlich als Notstopp gemeldet, damit der
-        # Multiplexer die Geschwindigkeit hart auf 0 zwingt.
+        # Notstopp nur bei der *dynamischen* Vollbremsung. Im eingerasteten
+        # Halt bleibt er aus, denn der Multiplexer setzt bei Notstopp jede
+        # Achse auf 0 -- auch Rueckwaerts und Drehen. Der Bremswert 1.0 sperrt
+        # dagegen nur die Vorwaertsfahrt (multiplexer.py:109), sodass der
+        # Roboter vom Hindernis wegfahren kann, aber nicht hinein.
         estop_msg = Bool()
-        estop_msg.data = bool(brake >= 1.0)
+        estop_msg.data = bool(brake >= 1.0 and not holding)
         self.estop_pub.publish(estop_msg)
 
         distance_str = 'inf' if math.isinf(distance) else f'{distance:.2f}'
         status_msg = String()
+        state = 'HOLD' if holding else self.aeb.status(brake)
         status_msg.data = (
-            f'aeb={self.aeb.status(brake)};'
+            f'aeb={state};'
             f'brake={brake:.2f};'
             f'distance={distance_str};'
             f'speed={self.speed:.2f}'
