@@ -24,9 +24,17 @@ class Multiplexer(Node):
         # --- PUBLISHER (Ausgänge) ---
         self.nav_pause_pub = self.create_publisher(Bool, '/robot/nav_pause', 10)
 
-        self.cmd_vel_pub = self.create_publisher(Twist, '/cmd_vel', 10)
+        # Das Ausgangs-Topic ist ein Parameter, weil es von der Plattform abhaengt:
+        # der JetAuto-Chassis-Controller hoert auf /controller/cmd_vel, ein
+        # Simulations- oder Testaufbau eventuell auf /cmd_vel. Ein Publisher ohne
+        # Subscriber ist in ROS2 kein Fehler -- der Roboter steht dann einfach
+        # stumm da. Deshalb wird das benutzte Topic beim Start geloggt.
+        self.declare_parameter('cmd_vel_topic', '/controller/cmd_vel')
+        cmd_vel_topic = self.get_parameter('cmd_vel_topic').value
+
+        self.cmd_vel_pub = self.create_publisher(Twist, cmd_vel_topic, 10)
         self.feedback_pub = self.create_publisher(String, '/robot/feedback/status', 10)
-        
+
 
         # --- ZUSTANDS-VARIABLEN ---
         self.mode = "MANUAL"
@@ -40,7 +48,9 @@ class Multiplexer(Node):
 
         # Timer: Bewertet die Lage 10x pro Sekunde
         self.create_timer(0.1, self.control_loop)
-        self.get_logger().info("Control Node (Multiplexer) gestartet.")
+        self.get_logger().info(
+            f"Control Node (Multiplexer) gestartet. "
+            f"Fahrbefehle gehen an {cmd_vel_topic}")
 
     def mode_callback(self, msg):
         self.mode = msg.data
